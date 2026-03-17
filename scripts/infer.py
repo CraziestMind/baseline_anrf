@@ -76,11 +76,21 @@ class TestDataset(torch.utils.data.Dataset):
     def __len__(self):
         return self.N
 
+    def _normalize(self, arr, feat):
+        lo  = min_vals[feat]
+        hi  = max_vals[feat]
+        den = np.where((hi - lo) == 0, 1.0, hi - lo)
+        arr = (arr - lo) / den
+        if feat in WIND_FEATURES:
+            arr = 2.0 * arr - 1.0
+        elif feat in EMISSION_FEATURES + ['NMVOC_combined']:
+            arr = np.clip(arr, 0.0, 1.0)
+        return arr.astype(np.float32)
+
     def __getitem__(self, idx):
         x = np.empty((time_input, S1, S2, V), dtype=np.float32)
         for c, feat in enumerate(all_features):
-            arr = self.arrs[feat][idx]          # shape: (T, H, W) — T differs per feature
-            arr = arr[:time_input]              # take first 10 timesteps for all features
+            arr = self.arrs[feat][idx, :time_input]
             x[..., c] = self._normalize(arr, feat)
         return torch.from_numpy(x)
 
