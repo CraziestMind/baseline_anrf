@@ -33,7 +33,8 @@ min_pm = min_vals['cpm25']
 max_pm = max_vals['cpm25']
 
 def denorm(x):
-    return x * (max_pm - min_pm) + min_pm
+    # min_pm, max_pm shape: (140, 124) → reshape to (1, 140, 124, 1) for broadcasting
+    return x * (max_pm - min_pm)[np.newaxis, :, :, np.newaxis] + min_pm[np.newaxis, :, :, np.newaxis]
 
 # -----------------------
 # Settings
