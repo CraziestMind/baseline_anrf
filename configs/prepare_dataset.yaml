@@ -4,7 +4,7 @@ paths:
   val_savepath:   /kaggle/temp/data/val/
 
 data:
-  months:   ['APRIL_16', 'JULY_16', 'OCTOBER_16', 'DECEMBER_16']
+  months:   ['APRIL_16', 'JULY_16', 'OCT_16', 'DEC_16']
   horizon:  26
   stride:   2       # was 1, reduces dataset from ~64GB to ~32GB
   val_frac: 0.2
