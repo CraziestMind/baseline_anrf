@@ -10,9 +10,9 @@ torch.set_num_threads(1)
 
 import numpy as np
 import json
-from tqdm import tqdm
 import os
 import time
+from tqdm import tqdm
 
 # -----------------------
 # Load config
@@ -32,6 +32,7 @@ np.random.seed(0)
 # -----------------------
 time_input = cfg.data.time_input
 time_out   = cfg.data.time_out
+T          = time_input + time_out
 S1         = cfg.data.S1
 S2         = cfg.data.S2
 
@@ -48,55 +49,65 @@ savepath_val   = cfg.paths.savepath_val
 print(f"Features ({V}): {all_features}")
 
 # =========================================================
-# Dataloader
+# Dataset — full preload into RAM
+# Loads all per-feature files and stacks into one array
+# (N, T, H, W, F) fully in RAM — zero file I/O during training
 # =========================================================
 class DataLoaders(torch.utils.data.Dataset):
 
-    def __init__(self, split, savepath_train, savepath_val):
-        self.time_input = cfg.data.time_input
-        self.time_out   = cfg.data.time_out
-        self.S1         = cfg.data.S1
-        self.S2         = cfg.data.S2
-
+    def __init__(self, split):
         base_path = savepath_train if split == "train" else savepath_val
-        filename  = "train_data.npy" if split == "train" else "val_data.npy"
+        if split not in ("train", "val"):
+            raise ValueError(f"Unknown split: {split}")
 
-        # Single mmap read — (N, 26, H, W, F)
-        self.data = np.load(os.path.join(base_path, filename), mmap_mode="r")
-        self.N    = self.data.shape[0]
+        print(f"\nPreloading {split} dataset into RAM...")
+        N = None
+        self.data = None
+
+        for i, feat in enumerate(all_features):
+            path = os.path.join(base_path, f"{split}_{feat}.npy")
+            arr  = np.load(path).astype(np.float32)  # (N, 26, H, W)
+
+            if self.data is None:
+                N = arr.shape[0]
+                self.data = np.empty((N, T, S1, S2, V), dtype=np.float32)
+
+            self.data[..., i] = arr[:, :T]
+            del arr
+            print(f"  loaded {feat} ({i+1}/{V})")
+
+        self.N = N
+        print(f"  Done. shape={self.data.shape}  "
+              f"RAM={self.data.nbytes/1e9:.1f} GB\n")
 
     def __len__(self):
         return self.N
 
     def __getitem__(self, idx):
-        sample = self.data[idx]                              # (26, H, W, F)
-        x = torch.from_numpy(sample[:self.time_input].copy())       # (10, H, W, F)
+        sample = self.data[idx]                                    # (T, H, W, F)
+        x = torch.from_numpy(sample[:time_input].copy())          # (10, H, W, F)
         y = torch.from_numpy(
-                sample[self.time_input:, ..., 0].copy()             # (16, H, W) — cpm25 only
-            ).permute(1, 2, 0)                               # (H, W, 16)
+                sample[time_input:, ..., 0].copy()                # (16, H, W)
+            ).permute(1, 2, 0)                                     # (H, W, 16)
         return x, y
 
 
-train_dataset = DataLoaders("train", savepath_train, savepath_val)
-val_dataset   = DataLoaders("val",   savepath_train, savepath_val)
+train_dataset = DataLoaders("train")
+val_dataset   = DataLoaders("val")
 
 train_loader = torch.utils.data.DataLoader(
     train_dataset,
     batch_size=batch_size,
     shuffle=True,
-    num_workers=4,
+    num_workers=0,      # 0 because data is already in RAM, no I/O needed
     pin_memory=True,
-    persistent_workers=True,
-    prefetch_factor=4
 )
 val_loader = torch.utils.data.DataLoader(
     val_dataset,
     batch_size=batch_size,
     shuffle=False,
-    num_workers=4,
+    num_workers=0,
     pin_memory=True,
-    persistent_workers=True,
-    prefetch_factor=4
 )
 
 # =========================================================
@@ -168,10 +179,10 @@ for ep in tqdm(range(epochs)):
     duration  = time.time() - t_start
 
     log.append({
-        "epoch":          ep,
-        "duration":       duration,
-        "train_l2":       train_l2,
-        "val_l2":         val_l2,
+        "epoch":    ep,
+        "duration": duration,
+        "train_l2": train_l2,
+        "val_l2":   val_l2,
     })
 
     print(f"ep={ep}  t={duration:.1f}s  train={train_l2:.4f}  val={val_l2:.4f}")
