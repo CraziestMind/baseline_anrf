@@ -26,27 +26,32 @@ ALL_RAW_FEATURES = MET_FEATURES + WIND_FEATURES + EMISSION_FEATURES + ['NMVOC_e'
 # -----------------------
 def compute_gridwise_stats(months):
     print("\n=== Computing grid-wise normalization stats ===\n")
-
     min_vals = {}
     max_vals = {}
 
     for feat in ALL_RAW_FEATURES:
         print(f"  {feat}...")
-        arrays = []
+        running_min = None
+        running_max = None
+
         for month in months:
             arr = np.load(os.path.join(RAW_PATH, month, f"{feat}.npy")).astype(np.float32)
-            arrays.append(arr)  # (T, H, W)
+            m_min = arr.min(axis=0)  # (H, W)
+            m_max = arr.max(axis=0)  # (H, W)
+            del arr
 
-        combined = np.concatenate(arrays, axis=0)  # (T_total, H, W)
-        min_vals[feat] = combined.min(axis=0)       # (H, W)
-        max_vals[feat] = combined.max(axis=0)       # (H, W)
-        del arrays, combined
+            if running_min is None:
+                running_min = m_min
+                running_max = m_max
+            else:
+                running_min = np.minimum(running_min, m_min)
+                running_max = np.maximum(running_max, m_max)
 
-    # NMVOC_combined stats
+        min_vals[feat] = running_min
+        max_vals[feat] = running_max
+
     min_vals['NMVOC_combined'] = np.minimum(min_vals['NMVOC_e'], min_vals['NMVOC_finn'])
     max_vals['NMVOC_combined'] = np.maximum(max_vals['NMVOC_e'], max_vals['NMVOC_finn'])
-
-    print("  Done.\n")
     return min_vals, max_vals
 
 # -----------------------
