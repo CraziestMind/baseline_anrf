@@ -1,155 +1,180 @@
 import os
-import sys
 import numpy as np
-from tqdm import tqdm
-from scipy import io
-
 from src.utils.config import load_config
 
 # -----------------------
 # Load config
 # -----------------------
-
 cfg = load_config("configs/prepare_dataset.yaml")
-RAW_PATH  = cfg.paths.raw_path
+RAW_PATH = cfg.paths.raw_path
 
 # -----------------------
-# Load min–max stats
+# Feature definitions
 # -----------------------
+WIND_FEATURES     = ['u10', 'v10']
+MET_FEATURES      = ['cpm25', 'pblh', 'rain']
+EMISSION_FEATURES = ['PM25', 'NH3', 'SO2', 'NOx']
 
-min_max = io.loadmat(cfg.paths.min_max_file)
-all_features = cfg.features.met_variables_raw + cfg.features.emission_variables_raw
+SAVE_FEATURES = MET_FEATURES + WIND_FEATURES + EMISSION_FEATURES + ['NMVOC_combined']
+# = ['cpm25', 'pblh', 'rain', 'u10', 'v10', 'PM25', 'NH3', 'SO2', 'NOx', 'NMVOC_combined']
 
-min_vals = {f: min_max[f"{f}_min"].item() for f in all_features}
-max_vals = {f: min_max[f"{f}_max"].item() for f in all_features}
+ALL_RAW_FEATURES = MET_FEATURES + WIND_FEATURES + EMISSION_FEATURES + ['NMVOC_e', 'NMVOC_finn']
 
 # -----------------------
-# Helper Functions
+# Step 1: Compute grid-wise stats from all training months
+# Grid-wise = per (lat, lon) point, shape (H, W)
 # -----------------------
+def compute_gridwise_stats(months):
+    print("\n=== Computing grid-wise normalization stats ===\n")
 
-def train_val_split(samples, val_frac=0.2, seed=0):
+    min_vals = {}
+    max_vals = {}
+
+    for feat in ALL_RAW_FEATURES:
+        print(f"  {feat}...")
+        arrays = []
+        for month in months:
+            arr = np.load(os.path.join(RAW_PATH, month, f"{feat}.npy")).astype(np.float32)
+            arrays.append(arr)  # (T, H, W)
+
+        combined = np.concatenate(arrays, axis=0)  # (T_total, H, W)
+        min_vals[feat] = combined.min(axis=0)       # (H, W)
+        max_vals[feat] = combined.max(axis=0)       # (H, W)
+        del arrays, combined
+
+    # NMVOC_combined stats
+    min_vals['NMVOC_combined'] = np.minimum(min_vals['NMVOC_e'], min_vals['NMVOC_finn'])
+    max_vals['NMVOC_combined'] = np.maximum(max_vals['NMVOC_e'], max_vals['NMVOC_finn'])
+
+    print("  Done.\n")
+    return min_vals, max_vals
+
+# -----------------------
+# Step 2: Normalize
+# -----------------------
+def normalize(arr, feat, min_vals, max_vals):
+    lo  = min_vals[feat]   # (H, W)
+    hi  = max_vals[feat]   # (H, W)
+    den = hi - lo
+    den = np.where(den == 0, 1.0, den)  # avoid divide by zero at dead grid points
+
+    arr = (arr - lo) / den              # broadcast over T dimension: (T, H, W)
+
+    if feat in WIND_FEATURES:
+        arr = 2.0 * arr - 1.0
+    elif feat in EMISSION_FEATURES + ['NMVOC_combined']:
+        arr = np.clip(arr, 0.0, 1.0)
+
+    return arr.astype(np.float32)
+
+# -----------------------
+# Step 3: Sliding window
+# -----------------------
+def make_samples(arr, horizon, stride):
+    return np.stack(
+        [arr[i : i + horizon] for i in range(0, arr.shape[0] - horizon + 1, stride)],
+        axis=0
+    )  # (N, horizon, H, W)
+
+# -----------------------
+# Step 4: Train/val split — same indices for all features
+# Returns indices, not data
+# -----------------------
+def get_split_indices(N, val_frac, seed):
     np.random.seed(seed)
-    N = samples.shape[0]
-    idx = np.random.permutation(N)
+    idx   = np.random.permutation(N)
     n_val = int(val_frac * N)
+    return idx[n_val:], idx[:n_val]  # train_idx, val_idx
 
-    val_idx = idx[:n_val]
-    train_idx = idx[n_val:]
+# -----------------------
+# Step 5: Load and normalize one feature for one month
+# -----------------------
+def load_feature_month(feat, month, min_vals, max_vals):
+    if feat == 'NMVOC_combined':
+        arr_e    = np.load(os.path.join(RAW_PATH, month, "NMVOC_e.npy")).astype(np.float32)
+        arr_finn = np.load(os.path.join(RAW_PATH, month, "NMVOC_finn.npy")).astype(np.float32)
+        raw = (arr_e + arr_finn) / 2.0
+        del arr_e, arr_finn
+    else:
+        raw = np.load(os.path.join(RAW_PATH, month, f"{feat}.npy")).astype(np.float32)
 
-    return samples[train_idx], samples[val_idx]
-
-
-def create_timeseries_samples(
-    month,
-    feature_list,
-    train_save_dir,
-    val_save_dir, 
-    val_frac,
-    seed,
-    horizon,
-    stride,
-):
-    train_data = {}
-    val_data = {}
-
-    for feat in tqdm(feature_list):
-
-        file_path = os.path.join(RAW_PATH, month, f"{feat}.npy")
-        arr = np.load(file_path).astype(np.float32)
-
-
-        minn = min_vals[feat]
-        maxx = max_vals[feat]
-        den  = maxx - minn
-
-        arr = (arr - minn) / den
-
-        if feat in ["u10", "v10"]:
-            arr = 2.0 * arr - 1.0
-
-        if feat in cfg.features.emission_variables_raw:
-            arr = np.clip(arr, 0, 1)
-
-
-        print("Original shape:", arr.shape)
-
-        T = arr.shape[0]
-        idx = range(0, T - horizon + 1, stride)
-
-        samples = np.stack([arr[i:i+horizon] for i in idx], axis=0)
-
-        print("Total samples created -", samples.shape[0])
-
-        train_samples, val_samples = train_val_split(
-            samples, val_frac=val_frac, seed=seed
-        )
-
-        train_data[feat] = train_samples
-        val_data[feat]   = val_samples
-
-        del arr, samples
-
-    return train_data, val_data
-
+    return normalize(raw, feat, min_vals, max_vals)
 
 # -----------------------
 # Run
 # -----------------------
-
 os.makedirs(cfg.paths.train_savepath, exist_ok=True)
-os.makedirs(cfg.paths.val_savepath, exist_ok=True)
+os.makedirs(cfg.paths.val_savepath,   exist_ok=True)
 
-print(f"\n==============================")
-print(f"Train Save path: {cfg.paths.train_savepath}")
-print(f"Val Save path: {cfg.paths.val_savepath}") 
-print(f"Horizon={cfg.data.horizon}, Stride={cfg.data.stride}")
-print(f"==============================\n")
+horizon  = cfg.data.horizon
+stride   = cfg.data.stride
+val_frac = cfg.data.val_frac
+seed     = cfg.data.seed
+months   = cfg.data.months
 
-for feat in all_features:
+print(f"\n{'='*40}")
+print(f"Train : {cfg.paths.train_savepath}")
+print(f"Val   : {cfg.paths.val_savepath}")
+print(f"Horizon={horizon}  Stride={stride}")
+print(f"Features ({len(SAVE_FEATURES)}): {SAVE_FEATURES}")
+print(f"{'='*40}\n")
 
-    print("\n===================================")
-    print("Processing feature:", feat)
-    print("===================================\n")
+# Compute grid-wise stats
+min_vals, max_vals = compute_gridwise_stats(months)
 
-    train_chunks = []
-    val_chunks   = []
+# Save stats for inference (grid-wise, shape H x W per feature)
+np.save(
+    os.path.join(cfg.paths.train_savepath, "norm_stats.npy"),
+    {'min': min_vals, 'max': max_vals}
+)
+# Backup to working dir (persists after session)
+np.save("/kaggle/working/norm_stats.npy", {'min': min_vals, 'max': max_vals})
+print("Stats saved.\n")
 
-    for month in cfg.data.months:
+# Build stacked dataset month by month
+# Final output: (N, horizon, H, W, F) — single array, one read per sample in dataloader
+train_chunks = []
+val_chunks   = []
 
-        print(f"Month: {month}")
-        print(f"==============================\n")
+for month in months:
+    print(f"\n=== Month: {month} ===")
 
-        train_m, val_m = create_timeseries_samples(
-            month=month,
-            feature_list=[feat],
-            train_save_dir=cfg.paths.train_savepath,
-            val_save_dir=cfg.paths.val_savepath,
-            val_frac=cfg.data.val_frac,
-            seed=cfg.data.seed,
-            horizon=cfg.data.horizon,
-            stride=cfg.data.stride,
-        )
+    # Load all features for this month: list of (T, H, W)
+    feature_arrays = []
+    for feat in SAVE_FEATURES:
+        arr = load_feature_month(feat, month, min_vals, max_vals)
+        feature_arrays.append(arr)
+        print(f"  loaded {feat}: {arr.shape}")
 
-        train_chunks.append(train_m[feat])
-        val_chunks.append(val_m[feat])
+    # Stack features: (T, H, W, F)
+    stacked = np.stack(feature_arrays, axis=-1)
+    del feature_arrays
+    print(f"  stacked: {stacked.shape}")
 
-        del train_m, val_m
-
-    train_merged = np.concatenate(train_chunks, axis=0)
-    val_merged   = np.concatenate(val_chunks, axis=0)
-
-    print(
-        f"\nFinal {feat} -> Train:", train_merged.shape,
-        "Val:", val_merged.shape
+    # Sliding window over time: (N, horizon, H, W, F)
+    samples = np.stack(
+        [stacked[i : i + horizon] for i in range(0, stacked.shape[0] - horizon + 1, stride)],
+        axis=0
     )
+    del stacked
+    print(f"  samples: {samples.shape}")
 
-    np.save(
-        os.path.join(cfg.paths.train_savepath, f"train_{feat}.npy"),
-        train_merged.astype(np.float32)
-    )
-    np.save(
-        os.path.join(cfg.paths.val_savepath, f"val_{feat}.npy"),
-        val_merged.astype(np.float32)
-    )
+    # Split indices (consistent across features since stacked)
+    train_idx, val_idx = get_split_indices(len(samples), val_frac, seed)
+    train_chunks.append(samples[train_idx])
+    val_chunks.append(samples[val_idx])
+    del samples
 
-    del train_chunks, val_chunks, train_merged, val_merged
+# Concatenate across months
+train_data = np.concatenate(train_chunks, axis=0).astype(np.float32)
+val_data   = np.concatenate(val_chunks,   axis=0).astype(np.float32)
+del train_chunks, val_chunks
+
+print(f"\nFinal train: {train_data.shape}  {train_data.nbytes / 1e9:.1f} GB")
+print(f"Final val:   {val_data.shape}  {val_data.nbytes / 1e9:.1f} GB")
+
+np.save(os.path.join(cfg.paths.train_savepath, "train_data.npy"), train_data)
+np.save(os.path.join(cfg.paths.val_savepath,   "val_data.npy"),   val_data)
+del train_data, val_data
+
+print("\n=== Preparation complete ===")
