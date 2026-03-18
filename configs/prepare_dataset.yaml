@@ -6,7 +6,7 @@ paths:
 data:
   months:   ['APRIL_16', 'JULY_16', 'OCT_16', 'DEC_16']
   horizon:  26
-  stride:   3       # was 1, reduces dataset from ~64GB to ~32GB
+  stride:   3       # was 1, reduces dataset from ~64GB to ~21GB
   val_frac: 0.2
   seed:     0
 
